@@ -1,4 +1,3 @@
-Berikut adalah rangkuman catatan lengkap spesifikasi teknis dan fungsional Web War Room CTF & Programming yang telah kita susun secara menyeluruh:
 ### 1. Analisis Masalah & Kebutuhan
  * Masalah Utama: Kompetisi CTF sering kali mengalami *context switching* yang tinggi karena komunikasi dan kolaborasi terpecah di berbagai aplikasi (Discord untuk suara, aplikasi lain untuk berbagi kode/gambar), memicu beban bandwidth berlebih serta risiko kebocoran data sensitif.
  * Fungsi Utama: Membangun *war room* virtual yang terpusat, *real-time*, dan sekali pakai (ephemeral) yang berfokus pada sinkronisasi koordinat kanvas serta teks kode tanpa integrasi server media berat.
