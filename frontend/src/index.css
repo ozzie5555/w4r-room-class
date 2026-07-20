@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  --color-deep-charcoal: #0D1117;
+  --color-workspace-grid: #1A1F26;
+  --color-panel: #161B22;
+  --color-accent: #3b82f6;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  
+  html, body {
+    @apply bg-deep-charcoal text-gray-200 h-screen w-screen overflow-hidden;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+.canvas-grid {
+  background-size: 20px 20px;
+  background-image: radial-gradient(circle, #2d3748 1px, transparent 1px);
+}
+
+.code-sandbox-overlay {
+  background: rgba(13, 17, 23, 0.85);
+  backdrop-filter: blur(4px);
+}
