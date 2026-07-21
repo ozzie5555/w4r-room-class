@@ -1,9 +1,14 @@
 import { useRoomStore } from '../store';
-import { CheckSquare, Square, FileTerminal, Download, Trash2, Plus } from 'lucide-react';
+import { CheckSquare, Square, FileTerminal, Download, Trash2, Plus, SquarePen } from 'lucide-react';
+import type { Payload } from '../store';
 
 export function BinariesAndTasks() {
   const { tasks, toggleTask, role, payloads, addPayload, removePayload, addTask } = useRoomStore();
   const canWrite = role === 'Host' || role === 'Presenter';
+
+  const openPayloadInEditor = (payload: Payload) => {
+    window.dispatchEvent(new CustomEvent('open-payload-in-editor', { detail: payload }));
+  };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!canWrite || !e.target.files || e.target.files.length === 0) return;
@@ -13,7 +18,8 @@ export function BinariesAndTasks() {
     
     reader.onload = (event) => {
       const base64Data = event.target?.result as string;
-      addPayload(file.name, base64Data);
+      const payload = addPayload(file.name, base64Data);
+      openPayloadInEditor(payload);
     };
     
     reader.readAsDataURL(file);
@@ -55,7 +61,14 @@ export function BinariesAndTasks() {
           {payloads.map((payload) => (
             <div key={payload.id} className="flex items-center justify-between p-2 rounded bg-white/5 border border-white/5 hover:border-white/10 transition-colors group">
               <span className="text-xs font-mono text-gray-300 truncate mr-2">{payload.filename}</span>
-              <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+              <div className="flex gap-2 opacity-60 group-hover:opacity-100 transition-opacity shrink-0">
+                <button
+                  onClick={() => openPayloadInEditor(payload)}
+                  className="text-gray-400 hover:text-accent cursor-pointer"
+                  title="Open in code editor"
+                >
+                  <SquarePen className="w-3.5 h-3.5" />
+                </button>
                 <button onClick={() => handleDownload(payload.filename, payload.data)} className="text-gray-400 hover:text-white cursor-pointer"><Download className="w-3.5 h-3.5" /></button>
                 {canWrite && (
                   <button onClick={() => removePayload(payload.id)} className="text-gray-400 hover:text-rose-400 cursor-pointer">
@@ -71,7 +84,8 @@ export function BinariesAndTasks() {
                 onClick={() => {
                   const filename = prompt('Enter new filename:', 'script.js');
                   if (filename && filename.trim()) {
-                    addPayload(filename.trim(), 'ZGF0YTp0ZXh0L3BsYWluO2Jhc2U2NCw='); // Empty string base64
+                    const payload = addPayload(filename.trim(), 'data:text/plain;charset=utf-8,');
+                    openPayloadInEditor(payload);
                   }
                 }}
                 className="flex-1 py-2 border border-dashed border-gray-700 rounded text-xs text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors cursor-pointer flex items-center justify-center gap-1"

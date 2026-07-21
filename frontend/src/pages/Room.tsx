@@ -54,6 +54,15 @@ export function Room() {
           case 'DRAW':
             window.dispatchEvent(new CustomEvent('remote-draw', { detail: data }));
             break;
+          case 'CLEAR_CANVAS':
+            window.dispatchEvent(new CustomEvent('clear-canvas'));
+            break;
+          case 'UNDO_CANVAS':
+            window.dispatchEvent(new CustomEvent('undo-canvas'));
+            break;
+          case 'REDO_CANVAS':
+            window.dispatchEvent(new CustomEvent('redo-canvas'));
+            break;
         }
       } catch (e) {
         console.error(e);
@@ -63,7 +72,7 @@ export function Room() {
     return () => {
       ws.close();
     };
-  }, [roomId, userId]);
+  }, [roomId, userId, setConnected]);
 
   const getRoleBadge = () => {
     switch (role) {

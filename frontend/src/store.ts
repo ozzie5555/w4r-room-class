@@ -41,7 +41,8 @@ interface RoomState {
   requestChalk: () => void
   grantChalk: (userId: string) => void
   revokeAllChalk: () => void
-  addPayload: (filename: string, data: string) => void
+  addPayload: (filename: string, data: string) => Payload
+  updatePayload: (payloadId: string, data: string) => void
   removePayload: (payloadId: string) => void
   addTask: (title: string) => void
   removeTask: (taskId: string) => void
@@ -115,6 +116,14 @@ export const useRoomStore = create<RoomState>((set, get) => ({
     // Optimistic local update
     set((state) => ({ payloads: [...state.payloads, newPayload] }))
     get().ws?.send(JSON.stringify({ type: 'ADD_PAYLOAD', payload: newPayload }))
+    return newPayload
+  },
+
+  updatePayload: (payloadId, data) => {
+    set((state) => ({
+      payloads: state.payloads.map((payload) => payload.id === payloadId ? { ...payload, data } : payload),
+    }))
+    get().ws?.send(JSON.stringify({ type: 'UPDATE_PAYLOAD', payloadId, data }))
   },
 
   removePayload: (payloadId) => {

@@ -1,346 +1,656 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { useRoomStore } from '../store';
-import CodeMirror from '@uiw/react-codemirror';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRoomStore, type Payload } from '../store';
+import CodeMirror, { type ReactCodeMirrorRef } from '@uiw/react-codemirror';
 import { javascript } from '@codemirror/lang-javascript';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { undo, redo } from '@codemirror/commands';
-import { Maximize2, Move, Type, Trash2, Undo2, Redo2, LayoutDashboard, LayoutTemplate, LayoutGrid } from 'lucide-react';
+import {
+  FileCode2,
+  Grip,
+  LayoutDashboard,
+  LayoutGrid,
+  LayoutTemplate,
+  Maximize2,
+  Plus,
+  Redo2,
+  Trash2,
+  Undo2,
+  X,
+} from 'lucide-react';
+
+type Layout = 'split' | 'code' | 'canvas';
+type ActiveSurface = 'canvas' | 'editor';
+
+interface EditorTab {
+  id: string;
+  filename: string;
+  content: string;
+  source: 'shared' | 'payload';
+  payloadId?: string;
+}
+
+interface DrawEvent {
+  eventType: 'start' | 'draw' | 'end';
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+}
+
+const MAX_CANVAS_HISTORY = 40;
+
+const decodePayload = (data: string) => {
+  try {
+    if (!data.startsWith('data:')) {
+      return data;
+    }
+
+    const separator = data.indexOf(',');
+    if (separator === -1) return data;
+
+    const metadata = data.slice(0, separator);
+    const body = data.slice(separator + 1);
+
+    if (!metadata.includes(';base64')) {
+      return decodeURIComponent(body);
+    }
+
+    const binary = atob(body);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return '// Payload ini tidak dapat ditampilkan sebagai teks.';
+  }
+};
+
+const encodePayload = (content: string) =>
+  `data:text/plain;charset=utf-8,${encodeURIComponent(content)}`;
 
 export function HybridWorkspace() {
-  const { code, setCode, role, clearCanvas } = useRoomStore();
+  const {
+    code,
+    setCode,
+    role,
+    clearCanvas,
+    payloads,
+    addPayload,
+    updatePayload,
+  } = useRoomStore();
+
+  const rootRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const editorRef = useRef<any>(null);
-  
+  const editorRef = useRef<ReactCodeMirrorRef>(null);
+  const canvasUndoStack = useRef<ImageData[]>([]);
+  const canvasRedoStack = useRef<ImageData[]>([]);
+
   const [isDrawing, setIsDrawing] = useState(false);
   const [sandboxPos, setSandboxPos] = useState({ x: 50, y: 50 });
-  const [sandboxSize, setSandboxSize] = useState({ width: 500, height: 350 });
-  
+  const [sandboxSize, setSandboxSize] = useState({ width: 560, height: 380 });
   const [isDraggingSandbox, setIsDraggingSandbox] = useState(false);
   const [isResizingSandbox, setIsResizingSandbox] = useState(false);
-  
-  // Layout Options: 'split', 'code', 'canvas'
-  const [layout, setLayout] = useState<'split' | 'code' | 'canvas'>('split');
-  
-  const dragStartPos = useRef({ x: 0, y: 0 });
-  const resizeStart = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const [layout, setLayout] = useState<Layout>('split');
+  const [activeSurface, setActiveSurface] = useState<ActiveSurface>('canvas');
+  const [tabs, setTabs] = useState<EditorTab[]>([
+    {
+      id: 'shared-code',
+      filename: 'script.js',
+      content: code,
+      source: 'shared',
+    },
+  ]);
+  const [activeTabId, setActiveTabId] = useState('shared-code');
+
+  const dragStart = useRef({ pointerX: 0, pointerY: 0, x: 0, y: 0 });
+  const resizeStart = useRef({ pointerX: 0, pointerY: 0, width: 0, height: 0 });
 
   const canWrite = role === 'Host' || role === 'Presenter';
+  const activeTab = useMemo(
+    () => tabs.find((tab) => tab.id === activeTabId) ?? tabs[0],
+    [activeTabId, tabs],
+  );
 
-  // Canvas Logic
+  const configureCanvasContext = useCallback((context: CanvasRenderingContext2D) => {
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    context.lineWidth = 3;
+    context.strokeStyle = '#3b82f6';
+  }, []);
+
+  const captureCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext('2d');
+    if (!canvas || !context || canvas.width === 0 || canvas.height === 0) return null;
+    return context.getImageData(0, 0, canvas.width, canvas.height);
+  }, []);
+
+  const restoreCanvas = useCallback((snapshot: ImageData) => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext('2d');
+    if (!canvas || !context) return;
+
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.putImageData(snapshot, 0, 0);
+    configureCanvasContext(context);
+  }, [configureCanvasContext]);
+
+  const pushCanvasHistory = useCallback(() => {
+    const snapshot = captureCanvas();
+    if (!snapshot) return;
+
+    canvasUndoStack.current = [
+      ...canvasUndoStack.current.slice(-(MAX_CANVAS_HISTORY - 1)),
+      snapshot,
+    ];
+    canvasRedoStack.current = [];
+  }, [captureCanvas]);
+
+  const applyCanvasUndo = useCallback(() => {
+    const previous = canvasUndoStack.current.pop();
+    const current = captureCanvas();
+    if (!previous || !current) return;
+
+    canvasRedoStack.current.push(current);
+    restoreCanvas(previous);
+  }, [captureCanvas, restoreCanvas]);
+
+  const applyCanvasRedo = useCallback(() => {
+    const next = canvasRedoStack.current.pop();
+    const current = captureCanvas();
+    if (!next || !current) return;
+
+    canvasUndoStack.current.push(current);
+    restoreCanvas(next);
+  }, [captureCanvas, restoreCanvas]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
     const resize = () => {
-      canvas.width = canvas.parentElement?.clientWidth || 800;
-      canvas.height = canvas.parentElement?.clientHeight || 600;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = '#3b82f6';
+      const parent = canvas.parentElement;
+      if (!parent) return;
+
+      const nextWidth = Math.max(1, parent.clientWidth);
+      const nextHeight = Math.max(1, parent.clientHeight);
+      if (canvas.width === nextWidth && canvas.height === nextHeight) return;
+
+      const preserved = document.createElement('canvas');
+      preserved.width = canvas.width;
+      preserved.height = canvas.height;
+      preserved.getContext('2d')?.drawImage(canvas, 0, 0);
+
+      canvas.width = nextWidth;
+      canvas.height = nextHeight;
+
+      const context = canvas.getContext('2d');
+      if (!context) return;
+      context.drawImage(preserved, 0, 0);
+      configureCanvasContext(context);
     };
 
-    window.addEventListener('resize', resize);
+    const observer = new ResizeObserver(resize);
+    if (canvas.parentElement) observer.observe(canvas.parentElement);
     resize();
 
-    return () => window.removeEventListener('resize', resize);
+    return () => observer.disconnect();
+  }, [configureCanvasContext]);
+
+  useEffect(() => {
+    setTabs((currentTabs) =>
+      currentTabs.map((tab) =>
+        tab.source === 'shared' ? { ...tab, content: code } : tab,
+      ),
+    );
+  }, [code]);
+
+  useEffect(() => {
+    setTabs((currentTabs) =>
+      currentTabs.map((tab) => {
+        if (tab.source !== 'payload' || !tab.payloadId) return tab;
+        const payload = payloads.find((item) => item.id === tab.payloadId);
+        return payload ? { ...tab, filename: payload.filename, content: decodePayload(payload.data) } : tab;
+      }),
+    );
+  }, [payloads]);
+
+  const openPayload = useCallback((payload: Payload) => {
+    const tabId = `payload-${payload.id}`;
+    setTabs((currentTabs) => {
+      const existing = currentTabs.some((tab) => tab.id === tabId);
+      if (existing) {
+        return currentTabs.map((tab) =>
+          tab.id === tabId
+            ? { ...tab, filename: payload.filename, content: decodePayload(payload.data) }
+            : tab,
+        );
+      }
+
+      return [
+        ...currentTabs,
+        {
+          id: tabId,
+          filename: payload.filename,
+          content: decodePayload(payload.data),
+          source: 'payload',
+          payloadId: payload.id,
+        },
+      ];
+    });
+    setActiveTabId(tabId);
+    setActiveSurface('editor');
+    setLayout((currentLayout) => currentLayout === 'canvas' ? 'split' : currentLayout);
   }, []);
 
-  const draw = (e: React.MouseEvent | React.TouchEvent) => {
+  useEffect(() => {
+    const handleOpenPayload = (event: Event) => {
+      openPayload((event as CustomEvent<Payload>).detail);
+    };
+
+    window.addEventListener('open-payload-in-editor', handleOpenPayload);
+    return () => window.removeEventListener('open-payload-in-editor', handleOpenPayload);
+  }, [openPayload]);
+
+  const getCanvasPoint = (event: React.MouseEvent | React.TouchEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+
+    const rect = canvas.getBoundingClientRect();
+    const pointer = 'touches' in event ? event.touches[0] : event;
+    if (!pointer) return null;
+
+    return {
+      x: pointer.clientX - rect.left,
+      y: pointer.clientY - rect.top,
+    };
+  };
+
+  const startDrawing = (event: React.MouseEvent | React.TouchEvent) => {
+    if (!canWrite) return;
+
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext('2d');
+    const point = getCanvasPoint(event);
+    if (!canvas || !context || !point) return;
+
+    event.preventDefault();
+    pushCanvasHistory();
+    setActiveSurface('canvas');
+    setIsDrawing(true);
+    context.beginPath();
+    context.moveTo(point.x, point.y);
+
+    useRoomStore.getState().ws?.send(JSON.stringify({
+      type: 'DRAW',
+      eventType: 'start',
+      x: point.x,
+      y: point.y,
+      width: canvas.width,
+      height: canvas.height,
+    }));
+  };
+
+  const draw = (event: React.MouseEvent | React.TouchEvent) => {
     if (!isDrawing || !canWrite) return;
 
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    const context = canvas?.getContext('2d');
+    const point = getCanvasPoint(event);
+    if (!canvas || !context || !point) return;
 
-    const rect = canvas.getBoundingClientRect();
-    let clientX, clientY;
+    event.preventDefault();
+    context.lineTo(point.x, point.y);
+    context.stroke();
+    context.beginPath();
+    context.moveTo(point.x, point.y);
 
-    if ('touches' in e) {
-      clientX = e.touches[0].clientX;
-      clientY = e.touches[0].clientY;
-    } else {
-      clientX = (e as React.MouseEvent).clientX;
-      clientY = (e as React.MouseEvent).clientY;
-    }
-
-    const x = clientX - rect.left;
-    const y = clientY - rect.top;
-
-    requestAnimationFrame(() => {
-      ctx.lineTo(x, y);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      
-      const ws = useRoomStore.getState().ws;
-      if (ws) {
-        ws.send(JSON.stringify({ type: 'DRAW', x, y, width: canvas.width, height: canvas.height, eventType: 'draw' }));
-      }
-    });
-  };
-
-  const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
-    if (!canWrite) return;
-    setIsDrawing(true);
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.beginPath();
-        const ws = useRoomStore.getState().ws;
-        if (ws) ws.send(JSON.stringify({ type: 'DRAW', eventType: 'start' }));
-      }
-    }
-    draw(e);
+    useRoomStore.getState().ws?.send(JSON.stringify({
+      type: 'DRAW',
+      eventType: 'draw',
+      x: point.x,
+      y: point.y,
+      width: canvas.width,
+      height: canvas.height,
+    }));
   };
 
   const stopDrawing = () => {
     if (isDrawing) {
-      const canvas = canvasRef.current;
-      if (canvas) {
-        // Broadcast stroke end for undo history sync (simplified)
-        useRoomStore.getState().ws?.send(JSON.stringify({ type: 'DRAW', eventType: 'end' }));
-      }
+      useRoomStore.getState().ws?.send(JSON.stringify({ type: 'DRAW', eventType: 'end' }));
     }
     setIsDrawing(false);
-    const ctx = canvasRef.current?.getContext('2d');
-    if (ctx) ctx.beginPath();
+    canvasRef.current?.getContext('2d')?.beginPath();
   };
 
-  // Remote Drawing & Canvas Events
   useEffect(() => {
-    const handleRemoteDraw = (e: any) => {
-      const data = e.detail;
+    const handleRemoteDraw = (event: Event) => {
+      const data = (event as CustomEvent<DrawEvent>).detail;
       const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
+      const context = canvas?.getContext('2d');
+      if (!canvas || !context) return;
+
+      const scaleX = data.width ? canvas.width / data.width : 1;
+      const scaleY = data.height ? canvas.height / data.height : 1;
+      const x = (data.x ?? 0) * scaleX;
+      const y = (data.y ?? 0) * scaleY;
 
       if (data.eventType === 'start') {
-        ctx.beginPath();
+        pushCanvasHistory();
+        context.beginPath();
+        context.moveTo(x, y);
       } else if (data.eventType === 'draw') {
-        ctx.lineTo(data.x, data.y);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(data.x, data.y);
-      } else if (data.eventType === 'end') {
-        ctx.beginPath();
+        context.lineTo(x, y);
+        context.stroke();
+        context.beginPath();
+        context.moveTo(x, y);
+      } else {
+        context.beginPath();
       }
     };
-    
+
     const handleClearCanvas = () => {
       const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-      }
+      const context = canvas?.getContext('2d');
+      if (!canvas || !context) return;
+
+      pushCanvasHistory();
+      context.clearRect(0, 0, canvas.width, canvas.height);
     };
 
     window.addEventListener('remote-draw', handleRemoteDraw);
     window.addEventListener('clear-canvas', handleClearCanvas);
-    
+    window.addEventListener('undo-canvas', applyCanvasUndo);
+    window.addEventListener('redo-canvas', applyCanvasRedo);
+
     return () => {
       window.removeEventListener('remote-draw', handleRemoteDraw);
       window.removeEventListener('clear-canvas', handleClearCanvas);
+      window.removeEventListener('undo-canvas', applyCanvasUndo);
+      window.removeEventListener('redo-canvas', applyCanvasRedo);
     };
-  }, []);
+  }, [applyCanvasRedo, applyCanvasUndo, pushCanvasHistory]);
+
+  useEffect(() => {
+    if (layout === 'code') setActiveSurface('editor');
+    if (layout === 'canvas') setActiveSurface('canvas');
+  }, [layout]);
+
+  const runCanvasCommand = (type: 'UNDO_CANVAS' | 'REDO_CANVAS') => {
+    const socket = useRoomStore.getState().ws;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type }));
+      return;
+    }
+
+    if (type === 'UNDO_CANVAS') applyCanvasUndo();
+    else applyCanvasRedo();
+  };
+
+  const handleUnifiedUndo = () => {
+    if (!canWrite) return;
+    if (activeSurface === 'editor' && layout !== 'canvas') {
+      if (editorRef.current?.view) undo(editorRef.current.view);
+      return;
+    }
+    runCanvasCommand('UNDO_CANVAS');
+  };
+
+  const handleUnifiedRedo = () => {
+    if (!canWrite) return;
+    if (activeSurface === 'editor' && layout !== 'canvas') {
+      if (editorRef.current?.view) redo(editorRef.current.view);
+      return;
+    }
+    runCanvasCommand('REDO_CANVAS');
+  };
 
   const handleClear = () => {
-    if (canWrite) {
+    if (!canWrite) return;
+    const socket = useRoomStore.getState().ws;
+    if (socket?.readyState === WebSocket.OPEN) {
       clearCanvas();
-      window.dispatchEvent(new CustomEvent('clear-canvas'));
+      return;
     }
+
+    window.dispatchEvent(new CustomEvent('clear-canvas'));
   };
 
-  // Canvas Undo/Redo (Simulated for real-time app via WS broadcast)
-  const handleCanvasUndo = () => {
-    if (!canWrite) return;
-    useRoomStore.getState().ws?.send(JSON.stringify({ type: 'UNDO_CANVAS' }));
-  };
-
-  const handleCanvasRedo = () => {
-    if (!canWrite) return;
-    useRoomStore.getState().ws?.send(JSON.stringify({ type: 'REDO_CANVAS' }));
-  };
-
-  // Sandbox Dragging
-  const startDragSandbox = (e: React.MouseEvent) => {
-    if (!canWrite) return;
+  const startDragSandbox = (event: React.MouseEvent) => {
+    if (layout === 'code') return;
+    event.preventDefault();
     setIsDraggingSandbox(true);
-    dragStartPos.current = {
-      x: e.clientX - sandboxPos.x,
-      y: e.clientY - sandboxPos.y
+    dragStart.current = {
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      x: sandboxPos.x,
+      y: sandboxPos.y,
     };
   };
 
-  // Sandbox Resizing
-  const startResizeSandbox = (e: React.MouseEvent) => {
-    if (!canWrite) return;
-    e.stopPropagation();
+  const startResizeSandbox = (event: React.MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
     setIsResizingSandbox(true);
     resizeStart.current = {
-      x: e.clientX,
-      y: e.clientY,
+      pointerX: event.clientX,
+      pointerY: event.clientY,
       width: sandboxSize.width,
-      height: sandboxSize.height
+      height: sandboxSize.height,
     };
   };
 
-  const onMouseMove = (e: React.MouseEvent) => {
-    if (isDraggingSandbox) {
-      setSandboxPos({
-        x: e.clientX - dragStartPos.current.x,
-        y: e.clientY - dragStartPos.current.y
-      });
-    } else if (isResizingSandbox) {
-      setSandboxSize({
-        width: Math.max(300, resizeStart.current.width + (e.clientX - resizeStart.current.x)),
-        height: Math.max(200, resizeStart.current.height + (e.clientY - resizeStart.current.y))
-      });
+  useEffect(() => {
+    if (!isDraggingSandbox && !isResizingSandbox) return;
+
+    const handlePointerMove = (event: MouseEvent) => {
+      const bounds = rootRef.current?.getBoundingClientRect();
+      if (!bounds) return;
+
+      if (isDraggingSandbox) {
+        const nextX = dragStart.current.x + event.clientX - dragStart.current.pointerX;
+        const nextY = dragStart.current.y + event.clientY - dragStart.current.pointerY;
+        setSandboxPos({
+          x: Math.min(Math.max(0, nextX), Math.max(0, bounds.width - 120)),
+          y: Math.min(Math.max(0, nextY), Math.max(0, bounds.height - 56)),
+        });
+      }
+
+      if (isResizingSandbox) {
+        const requestedWidth = resizeStart.current.width + event.clientX - resizeStart.current.pointerX;
+        const requestedHeight = resizeStart.current.height + event.clientY - resizeStart.current.pointerY;
+        setSandboxSize({
+          width: Math.min(Math.max(340, requestedWidth), Math.max(340, bounds.width - sandboxPos.x)),
+          height: Math.min(Math.max(240, requestedHeight), Math.max(240, bounds.height - sandboxPos.y)),
+        });
+      }
+    };
+
+    const stopInteraction = () => {
+      setIsDraggingSandbox(false);
+      setIsResizingSandbox(false);
+    };
+
+    window.addEventListener('mousemove', handlePointerMove);
+    window.addEventListener('mouseup', stopInteraction);
+    return () => {
+      window.removeEventListener('mousemove', handlePointerMove);
+      window.removeEventListener('mouseup', stopInteraction);
+    };
+  }, [isDraggingSandbox, isResizingSandbox, sandboxPos.x, sandboxPos.y]);
+
+  const createCodeBoard = () => {
+    if (!canWrite) return;
+    const defaultName = `untitled-${payloads.length + 1}.js`;
+    const filename = prompt('Nama papan kode baru:', defaultName)?.trim();
+    if (!filename) return;
+
+    const payload = addPayload(filename, 'data:text/plain;charset=utf-8,');
+    openPayload(payload);
+  };
+
+  const closeTab = (tabId: string) => {
+    if (tabId === 'shared-code') return;
+
+    setTabs((currentTabs) => {
+      const closingIndex = currentTabs.findIndex((tab) => tab.id === tabId);
+      const remaining = currentTabs.filter((tab) => tab.id !== tabId);
+      if (activeTabId === tabId) {
+        const fallback = remaining[Math.max(0, closingIndex - 1)] ?? remaining[0];
+        setActiveTabId(fallback.id);
+      }
+      return remaining;
+    });
+  };
+
+  const handleCodeChange = (value: string) => {
+    if (!canWrite || !activeTab) return;
+
+    setTabs((currentTabs) =>
+      currentTabs.map((tab) => tab.id === activeTab.id ? { ...tab, content: value } : tab),
+    );
+
+    if (activeTab.source === 'shared') {
+      setCode(value);
+    } else if (activeTab.payloadId) {
+      updatePayload(activeTab.payloadId, encodePayload(value));
     }
   };
 
-  const onMouseUp = () => {
-    setIsDraggingSandbox(false);
-    setIsResizingSandbox(false);
-  };
-
-  // Editor Undo/Redo commands
-  const handleUndo = useCallback(() => {
-    if (editorRef.current?.view) {
-      undo(editorRef.current.view);
-    }
-  }, []);
-
-  const handleRedo = useCallback(() => {
-    if (editorRef.current?.view) {
-      redo(editorRef.current.view);
-    }
-  }, []);
+  const toolbarTarget = activeSurface === 'editor' && layout !== 'canvas'
+    ? activeTab?.filename ?? 'Editor'
+    : 'Canvas';
 
   return (
-    <div 
-      className="absolute inset-0 w-full h-full"
-      onMouseMove={isDraggingSandbox || isResizingSandbox ? onMouseMove : undefined}
-      onMouseUp={isDraggingSandbox || isResizingSandbox ? onMouseUp : undefined}
-      onMouseLeave={isDraggingSandbox || isResizingSandbox ? onMouseUp : undefined}
-    >
-      {/* Layout Controls */}
-      <div className="absolute top-4 right-4 z-20 flex bg-black/40 border border-gray-800 rounded-lg overflow-hidden shadow-lg p-1 gap-1">
-        <button onClick={() => setLayout('split')} className={`p-1.5 rounded ${layout === 'split' ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:text-white transition-colors'}`} title="Hybrid View">
+    <div ref={rootRef} className="absolute inset-0 w-full h-full select-none">
+      <div className="absolute top-4 right-4 z-30 flex bg-black/60 border border-gray-700 rounded-lg overflow-hidden shadow-lg p-1 gap-1">
+        <button
+          onClick={() => setLayout('split')}
+          className={`p-1.5 rounded ${layout === 'split' ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:text-white transition-colors'}`}
+          title="Canvas + code"
+        >
           <LayoutGrid className="w-4 h-4" />
         </button>
-        <button onClick={() => setLayout('code')} className={`p-1.5 rounded ${layout === 'code' ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:text-white transition-colors'}`} title="Code Only">
+        <button
+          onClick={() => setLayout('code')}
+          className={`p-1.5 rounded ${layout === 'code' ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:text-white transition-colors'}`}
+          title="Perbesar code editor"
+        >
           <LayoutDashboard className="w-4 h-4" />
         </button>
-        <button onClick={() => setLayout('canvas')} className={`p-1.5 rounded ${layout === 'canvas' ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:text-white transition-colors'}`} title="Canvas Only">
+        <button
+          onClick={() => setLayout('canvas')}
+          className={`p-1.5 rounded ${layout === 'canvas' ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:text-white transition-colors'}`}
+          title="Perbesar canvas"
+        >
           <LayoutTemplate className="w-4 h-4" />
         </button>
       </div>
 
-      {(layout === 'split' || layout === 'canvas') && (
-        <>
-          <canvas
-            ref={canvasRef}
-            className={`absolute inset-0 w-full h-full ${!canWrite ? 'pointer-events-none' : 'cursor-crosshair'}`}
-            onMouseDown={startDrawing}
-            onMouseMove={draw}
-            onMouseUp={stopDrawing}
-            onMouseOut={stopDrawing}
-            onTouchStart={startDrawing}
-            onTouchMove={draw}
-            onTouchEnd={stopDrawing}
-          />
-          
-          {canWrite && (
-            <div className="absolute bottom-4 left-4 flex gap-2 z-20">
-              <button 
-                onClick={handleCanvasUndo}
-                className="bg-black/40 text-gray-400 hover:text-white px-3 py-2 rounded-lg flex items-center gap-2 text-sm transition-colors shadow-lg border border-gray-800"
-                title="Undo Canvas"
-              >
-                <Undo2 className="w-4 h-4" /> Undo
-              </button>
-              <button 
-                onClick={handleCanvasRedo}
-                className="bg-black/40 text-gray-400 hover:text-white px-3 py-2 rounded-lg flex items-center gap-2 text-sm transition-colors shadow-lg border border-gray-800"
-                title="Redo Canvas"
-              >
-                <Redo2 className="w-4 h-4" /> Redo
-              </button>
-              <button 
-                onClick={handleClear}
-                className="bg-rose-500/10 text-rose-400 hover:bg-rose-500 hover:text-white px-3 py-2 rounded-lg flex items-center gap-2 text-sm transition-colors shadow-lg border border-rose-500/20"
-              >
-                <Trash2 className="w-4 h-4" /> Clear
-              </button>
-            </div>
-          )}
-        </>
-      )}
+        <canvas
+          ref={canvasRef}
+          className={`absolute inset-0 w-full h-full touch-none ${layout === "code" ? "invisible pointer-events-none" : !canWrite ? "pointer-events-none" : "cursor-crosshair"}`}
+          onMouseDown={startDrawing}
+          onMouseMove={draw}
+          onMouseUp={stopDrawing}
+          onMouseOut={stopDrawing}
+          onTouchStart={startDrawing}
+          onTouchMove={draw}
+          onTouchEnd={stopDrawing}
+        />
 
-      {/* Floating Code Sandbox */}
       {(layout === 'split' || layout === 'code') && (
-        <div 
-          className="absolute rounded-lg border border-gray-800 code-sandbox-overlay shadow-2xl flex flex-col overflow-hidden z-10"
-          style={{ 
+        <div
+          className="absolute rounded-lg border border-gray-700 code-sandbox-overlay shadow-2xl flex flex-col overflow-hidden z-10 min-w-0"
+          style={{
             transform: layout === 'code' ? 'none' : `translate(${sandboxPos.x}px, ${sandboxPos.y}px)`,
             width: layout === 'code' ? '100%' : sandboxSize.width,
             height: layout === 'code' ? '100%' : sandboxSize.height,
             inset: layout === 'code' ? '0' : 'auto',
-            borderRadius: layout === 'code' ? '0' : undefined
+            borderRadius: layout === 'code' ? '0' : undefined,
           }}
+          onMouseDown={() => setActiveSurface('editor')}
         >
-          <div 
-            className={`h-10 shrink-0 bg-black/80 border-b border-gray-800 flex items-center justify-between px-3 ${canWrite && layout !== 'code' ? 'cursor-move' : ''}`}
-            onMouseDown={layout !== 'code' ? startDragSandbox : undefined}
+          <div
+            className={`h-11 shrink-0 bg-black/85 border-b border-gray-800 flex items-center px-2 ${layout !== 'code' ? 'cursor-move' : ''}`}
+            onMouseDown={startDragSandbox}
           >
-            <div className="flex items-center gap-2 text-xs font-medium text-gray-400 pointer-events-none">
-              <Type className="w-3.5 h-3.5" />
-              Sandbox
-              
-              {/* Fake Tabs for UI */}
-              <div className="flex bg-black/40 ml-2 rounded border border-gray-800 pointer-events-auto">
-                <div className="px-3 py-1 bg-white/10 text-white rounded-sm border-b border-accent">script.js</div>
-                <div className="px-3 py-1 text-gray-500 hover:text-gray-300 cursor-pointer">payload.txt</div>
-              </div>
-            </div>
-            
-            <div className="flex gap-1" onMouseDown={(e) => e.stopPropagation()}>
+            {layout !== 'code' && (
+              <Grip className="w-4 h-4 text-gray-600 mr-1 shrink-0" aria-hidden="true" />
+            )}
+
+            <div
+              className="flex min-w-0 flex-1 items-end self-stretch overflow-x-auto"
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              {tabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => {
+                    setActiveTabId(tab.id);
+                    setActiveSurface('editor');
+                  }}
+                  className={`group/tab h-full max-w-44 min-w-28 px-3 flex items-center gap-2 border-r border-gray-800 text-xs font-mono transition-colors ${activeTabId === tab.id ? 'bg-white/10 text-white border-b-2 border-b-accent' : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'}`}
+                  title={tab.filename}
+                >
+                  <FileCode2 className="w-3.5 h-3.5 shrink-0" />
+                  <span className="truncate flex-1 text-left">{tab.filename}</span>
+                  {tab.id !== 'shared-code' && (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      className="opacity-0 group-hover/tab:opacity-100 hover:text-rose-400"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeTab(tab.id);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') closeTab(tab.id);
+                      }}
+                      aria-label={`Tutup ${tab.filename}`}
+                    >
+                      <X className="w-3 h-3" />
+                    </span>
+                  )}
+                </button>
+              ))}
+
               {canWrite && (
-                <>
-                  <button onClick={handleUndo} className="p-1 text-gray-500 hover:text-gray-300 hover:bg-white/10 rounded transition-colors" title="Undo Code">
-                    <Undo2 className="w-4 h-4" />
-                  </button>
-                  <button onClick={handleRedo} className="p-1 text-gray-500 hover:text-gray-300 hover:bg-white/10 rounded transition-colors" title="Redo Code">
-                    <Redo2 className="w-4 h-4" />
-                  </button>
-                  {layout !== 'code' && <div className="w-px h-4 bg-gray-700 my-auto mx-1" />}
-                </>
+                <button
+                  onClick={createCodeBoard}
+                  className="h-full px-3 text-gray-500 hover:text-white hover:bg-white/5 shrink-0"
+                  title="Tambah papan kode"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
               )}
+            </div>
+
+            <div
+              className="flex items-center gap-1 pl-2"
+              onMouseDown={(event) => event.stopPropagation()}
+            >
               {layout !== 'code' && (
-                <div className="w-3 h-3 my-auto mx-1 rounded-full bg-gray-700 hover:bg-gray-600 transition-colors cursor-pointer flex items-center justify-center">
-                  <Maximize2 className="w-2 h-2 text-transparent hover:text-white" />
-                </div>
+                <button
+                  onClick={() => setLayout('code')}
+                  className="p-1.5 text-gray-500 hover:text-white hover:bg-white/10 rounded"
+                  title="Perbesar editor"
+                >
+                  <Maximize2 className="w-4 h-4" />
+                </button>
               )}
             </div>
           </div>
-          
-          <div className={`flex-1 overflow-hidden ${layout === 'code' ? 'bg-[#282c34]' : 'bg-transparent'}`}>
+
+          <div className={`flex-1 overflow-hidden select-text ${layout === 'code' ? 'bg-[#282c34]' : 'bg-transparent'}`}>
             <CodeMirror
               ref={editorRef}
-              value={code}
-              height={layout === 'code' ? '100%' : `${sandboxSize.height - 40}px`}
+              value={activeTab?.content ?? ''}
+              height={layout === 'code' ? '100%' : `${sandboxSize.height - 44}px`}
               theme={oneDark}
               extensions={[javascript({ jsx: true })]}
-              onChange={(val) => canWrite && setCode(val)}
+              onFocus={() => setActiveSurface('editor')}
+              onChange={handleCodeChange}
               readOnly={!canWrite}
-              className={`text-sm font-mono h-full ${layout === 'code' ? '' : 'opacity-90 mix-blend-screen'}`}
+              className={`text-sm font-mono h-full ${layout === 'code' ? '' : 'opacity-95'}`}
               basicSetup={{
                 lineNumbers: true,
                 foldGutter: false,
@@ -348,17 +658,50 @@ export function HybridWorkspace() {
               }}
             />
           </div>
-          
-          {/* Resize Handle */}
-          {canWrite && layout !== 'code' && (
-            <div 
-              className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize z-10"
+
+          {layout !== 'code' && (
+            <button
+              className="absolute bottom-0 right-0 w-8 h-8 cursor-nwse-resize z-20 text-gray-400 hover:text-white bg-gradient-to-tl from-accent/30 to-transparent flex items-end justify-end p-1"
               onMouseDown={startResizeSandbox}
+              title="Tarik untuk mengubah ukuran editor"
+              aria-label="Ubah ukuran editor"
             >
-              <svg viewBox="0 0 24 24" className="w-full h-full text-gray-600 rotate-90 opacity-50 hover:opacity-100 transition-opacity">
-                <path fill="currentColor" d="M21 15v4a2 2 0 0 1-2 2h-4v-2h4v-4h2zm-2-6h2v4h-2V9zm0-4h2v2h-2V5zm-4-2v2h-2V3h2zm-4 0v2H9V3h2zM7 3v2H5V3h2zM3 5h2v2H3V5zm0 4h2v2H3V9zm0 4h2v2H3v-2zm0 4h2v2H3v-2zm4 2v2H5v-2h2zm4 0v2H9v-2h2zm4 0v2h-2v-2h2z" />
-              </svg>
-            </div>
+              <span className="block w-3 h-3 border-r-2 border-b-2 border-current" />
+            </button>
+          )}
+        </div>
+      )}
+
+      {canWrite && (
+        <div className="absolute bottom-4 left-4 z-30 flex items-center bg-black/70 border border-gray-700 rounded-lg shadow-xl overflow-hidden">
+          <span className="max-w-36 truncate px-3 text-[11px] font-mono text-gray-500 border-r border-gray-700">
+            {toolbarTarget}
+          </span>
+          <button
+            onClick={handleUnifiedUndo}
+            className="text-gray-400 hover:text-white hover:bg-white/10 px-3 py-2 flex items-center gap-2 text-sm transition-colors"
+            title={`Undo ${toolbarTarget}`}
+          >
+            <Undo2 className="w-4 h-4" />
+            Undo
+          </button>
+          <button
+            onClick={handleUnifiedRedo}
+            className="text-gray-400 hover:text-white hover:bg-white/10 px-3 py-2 flex items-center gap-2 text-sm transition-colors border-l border-gray-800"
+            title={`Redo ${toolbarTarget}`}
+          >
+            <Redo2 className="w-4 h-4" />
+            Redo
+          </button>
+          {(activeSurface === 'canvas' || layout === 'canvas') && layout !== 'code' && (
+            <button
+              onClick={handleClear}
+              className="text-rose-400 hover:bg-rose-500 hover:text-white px-3 py-2 flex items-center gap-2 text-sm transition-colors border-l border-gray-800"
+              title="Bersihkan canvas"
+            >
+              <Trash2 className="w-4 h-4" />
+              Clear
+            </button>
           )}
         </div>
       )}

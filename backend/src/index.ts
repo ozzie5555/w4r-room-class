@@ -155,6 +155,11 @@ const app = new Elysia()
         broadcastToRoom(roomId, { type: 'SYNC_PAYLOADS', payloads: getRoomState(roomId).payloads });
       }
       
+      else if (type === 'UPDATE_PAYLOAD') {
+        db.query('UPDATE payloads SET data = ? WHERE id = ? AND room_id = ?').run(message.data, message.payloadId, roomId);
+        broadcastToRoom(roomId, { type: 'SYNC_PAYLOADS', payloads: getRoomState(roomId).payloads }, ws);
+      }
+
       else if (type === 'REMOVE_PAYLOAD') {
         db.query('DELETE FROM payloads WHERE id = ? AND room_id = ?').run(message.payloadId, roomId);
         broadcastToRoom(roomId, { type: 'SYNC_PAYLOADS', payloads: getRoomState(roomId).payloads });
